@@ -10,7 +10,7 @@ class SaleOrder(models.Model):
     # CON UNA NOTA DE CREDITO DESDE CERO
     def _reprocess_from_global_invoice(self, global_invoice):
         self.ensure_one()
-        print(f"Iniciando reprocesamiento de orden {self.name}")
+        #print(f"Iniciando reprocesamiento de orden {self.name}")
 
         # Validar si ya existe NC
         existing_refund = self.invoice_ids.filtered(
@@ -28,8 +28,8 @@ class SaleOrder(models.Model):
         if not global_invoice:
             raise UserError(_("No hay una factura global válida y publicada."))
 
-        global_invoice = global_invoice[0]
-        print(f"Generando nueva nota de crédito (manual) basada en la orden: {self.name}")
+        global_invoice = global_invoice[0] # La factura siempre es la primera
+        #print(f"Generando nueva nota de crédito (manual) basada en la orden: {self.name}")
 
         # Crear encabezado de NC
         refund_vals = {
@@ -74,7 +74,7 @@ class SaleOrder(models.Model):
             invoice_lines.append(line_vals)
 
 
-            print(line_vals)
+            #print(line_vals)
 
         refund_vals['invoice_line_ids'] = invoice_lines
         #print(invoice_lines)
