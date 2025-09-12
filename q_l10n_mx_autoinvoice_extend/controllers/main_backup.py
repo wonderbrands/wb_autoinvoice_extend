@@ -3,7 +3,7 @@ from odoo.http import request
 from odoo.addons.q_l10n_mx_autoinvoice.controllers.main import Autoinvoice
 from datetime import date, timedelta
 
-class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice original
+class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice original.
 
     @http.route('/q_l10n_mx_autoinvoice/order', type='json', auth='public', website=True, csrf=False)
     def autoinvoice_order(self, number_order=False, amount_total=0):
