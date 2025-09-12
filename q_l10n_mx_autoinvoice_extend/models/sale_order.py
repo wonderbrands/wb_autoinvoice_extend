@@ -91,6 +91,7 @@ class SaleOrder(models.Model):
 
         # --------------------------------------------------------------------
         # Cambio 11-sep-2025
+        # Linkear la NC con factura global (Agregar pago)
         try:
             # Asegurarnos de trabajar con las líneas 'receivable' no reconciliadas
             inv_receivable_lines = global_invoice.line_ids.filtered(

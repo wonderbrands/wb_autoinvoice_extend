@@ -1,9 +1,29 @@
+# -*- coding: utf-8 -*-
 from odoo import http, _, fields
 from odoo.http import request
 from odoo.addons.q_l10n_mx_autoinvoice.controllers.main import Autoinvoice
 from datetime import date, timedelta
 
-class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice original
+# ----------------------------------------------------------
+#Normalización de textos
+# ----------------------------------------------------------
+import unicodedata
+
+def normalize_text(value):
+    """Convierte a MAYÚSCULAS y elimina acentos"""
+    if not value or not isinstance(value, str):
+        return value
+    nfkd = unicodedata.normalize('NFKD', value)
+    no_accent = ''.join([c for c in nfkd if not unicodedata.combining(c)])
+    return no_accent.upper()
+
+
+def normalize_values(values: dict):
+    """Normaliza todos los valores string de un dict"""
+    return {k: normalize_text(v) if isinstance(v, str) else v for k, v in values.items()}
+
+
+class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice original
 
     @http.route('/q_l10n_mx_autoinvoice/order', type='json', auth='public', website=True, csrf=False)
     def autoinvoice_order(self, number_order=False, amount_total=0):
@@ -163,3 +183,60 @@ class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice origina
             }
         except Exception as error:
             return {'error': str(error)}
+
+    # ----------------------------------------------------------
+    #Normalización en ADD_ADDRESS
+    # ----------------------------------------------------------
+    @http.route('/q_l10n_mx_autoinvoice/add_address', type='json', auth='public', website=True, csrf=False)
+    def autoinvoice_add_address(
+        self, name=False, vat=False, email=False, phone=False,
+        street_name=False, street_number=False,
+        l10n_mx_edi_colony=False, l10n_mx_edi_locality=False,
+        city=False, zipcode=False, country_id=False, state_id=False
+    ):
+        vals = normalize_values({
+            'name': name,
+            'vat': vat,
+            'email': email,
+            'phone': phone,
+            'street_name': street_name,
+            'street_number': street_number,
+            'l10n_mx_edi_colony': l10n_mx_edi_colony,
+            'l10n_mx_edi_locality': l10n_mx_edi_locality,
+            'city': city,
+            'zipcode': zipcode,
+        })
+
+        return super().autoinvoice_add_address(
+            vals['name'], vals['vat'], vals['email'], vals['phone'],
+            vals['street_name'], vals['street_number'],
+            vals['l10n_mx_edi_colony'], vals['l10n_mx_edi_locality'],
+            vals['city'], vals['zipcode'],
+            country_id, state_id
+        )
+
+    # ----------------------------------------------------------
+    #Normalización en INFORMATION
+    # ----------------------------------------------------------
+    @http.route('/q_l10n_mx_autoinvoice/information', type='json', auth='public', website=True, csrf=False)
+    def autoinvoice_information(self, invoice_id, fiscal_regime=False, use_of_cfdi=False, payment_method=False):
+        fiscal_regime = normalize_text(fiscal_regime)
+        use_of_cfdi = normalize_text(use_of_cfdi)
+        payment_method = normalize_text(payment_method)
+
+        return super().autoinvoice_information(
+            invoice_id, fiscal_regime, use_of_cfdi, payment_method
+        )
+
+    # ----------------------------------------------------------
+    #Normalización en VALIDATE_INVOICE
+    # ----------------------------------------------------------
+    @http.route('/q_l10n_mx_autoinvoice/validate_invoice', type='json', auth='public', website=True, csrf=False)
+    def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False, payment_method=False):
+        fiscal_regime = normalize_text(fiscal_regime)
+        use_of_cfdi = normalize_text(use_of_cfdi)
+        payment_method = normalize_text(payment_method)
+
+        return super().autoinvoice_validate_invoice(
+            invoice_id, fiscal_regime, use_of_cfdi, payment_method
+        )
