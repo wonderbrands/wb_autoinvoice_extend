@@ -34,9 +34,9 @@ class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice origina
 
         if order_date.year < today.year:
             if days_diff > 180 or today.month > 3:
-                return {'error': _('La orden es del año anterior. Solo puede refacturarse si tiene menos de 180 días y si estamos antes del 31 de marzo del año actual.')}
+                return {'error': _('La orden es del año anterior. Solo puede facturarse si tiene menos de 180 días y si estamos antes del 31 de marzo del año actual.')}
         elif days_diff > 180:
-            return {'error': _('La orden excede los 180 días permitidos para refacturación.')}
+            return {'error': _('La orden excede los 180 días permitidos para facturación.')}
 
         # -----------------------------------------------------------------------
         # Validar monto
@@ -100,6 +100,28 @@ class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice origina
             'country_id': request.env.ref('base.mx'),
         })
 
+
+        # ----------------------------------------------------------
+        # Cambio 11-sep-2025
+        # Imposibilita al cliente crear factura si aun no se ha entregado al menos una unidad de alun SKU
+        # Si solo tiene el envio hecho 'C-ENVIO', NO DEJA FACTURAR
+
+        SHIPPING_CODE = ['C-ENVIO']
+
+        # Filtramos las líneas que no sean envío
+        non_shipping_lines = order.order_line.filtered(lambda l: not (
+                (l.product_id.default_code and l.product_id.default_code.upper() in SHIPPING_CODE) or
+                (l.product_id.name and l.product_id.name.upper() in SHIPPING_CODE)
+        ))
+
+        # Comprobamos si hay alguna linea no envío con qty entregada > 0
+        delivered_non_shipping = any([l.qty_delivered > 0 for l in non_shipping_lines])
+        if not delivered_non_shipping:
+            return {'error': _(
+                'No se puede facturar: Aun no hay artículos a facturar para esta orden')}
+
+        # ----------------------------------------------------------
+
         return {
             'order_id': order.id,
             'template': template,
@@ -121,7 +143,7 @@ class AutoinvoiceExtended(Autoinvoice): # Heredo de la clase Autoinvoice origina
             invoice = order._create_invoices()
             invoice.write({
                 'partner_id': int(partner_id),
-                'ref': f"Factura cliente por refacturación de {order.name}",
+                'ref': f"Factura cliente de {order.name}",
             })
 
             template = request.env['ir.ui.view']._render_template(

@@ -89,6 +89,29 @@ class SaleOrder(models.Model):
         # Timbrar
         refund.button_process_edi_web_services()
 
+        # --------------------------------------------------------------------
+        # Cambio 11-sep-2025
+        try:
+            # Asegurarnos de trabajar con las líneas 'receivable' no reconciliadas
+            inv_receivable_lines = global_invoice.line_ids.filtered(
+                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id
+            )
+            ref_receivable_lines = refund.line_ids.filtered(
+                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id
+            )
+
+            # Si hay líneas para conciliar, las juntamos y reconciliamos
+            if inv_receivable_lines and ref_receivable_lines:
+                lines_to_reconcile = (inv_receivable_lines | ref_receivable_lines)
+                lines_to_reconcile.reconcile() # Metodo para pagar la NC a la factura global
+
+            else:
+                raise(f"No se encontraron líneas por conciliar entre NC {refund.name} y factura global {global_invoice.name}. Comuníquese con Servicio al Cliente")
+        except Exception as e:
+            raise(f"Error al reconciliar NC {refund.name} con factura global {global_invoice.name}: {e}. Comuníquese con Servicio al Cliente")
+            # No paramos el flujo: dejamos que el usuario revise manualmente si algo falla.
+        # --------------------------------------------------------------------
+
         # Agregar mensaje
         refund.message_post(
             body=f"<p>Nota de crédito generada automáticamente por refacturación de la orden <b>{self.name}</b> a partir de la factura global <b>{global_invoice.name}</b>.</p>",
