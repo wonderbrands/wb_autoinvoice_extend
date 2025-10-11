@@ -10,8 +10,8 @@
         'l10n_mx_edi',
     ],
     'data': [
-        'views/assets.xml',
         'views/website_templates.xml',
+        'views/assets.xml',
     ],
     'assets': {
         'web.assets_frontend': [
