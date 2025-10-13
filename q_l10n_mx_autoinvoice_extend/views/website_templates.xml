@@ -1,15 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
-    <template id="autoinvoice_address_extend_simplify" inherit_id="q_l10n_mx_autoinvoice.address">
-
+    <template id="autoinvoice_address_form_simplify" inherit_id="q_l10n_mx_autoinvoice.address">
         <xpath expr="//form" position="before">
             <div class="alert alert-info" role="alert" style="font-size: 1.1em;">
                 <i class="fa fa-info-circle mr-2"/>
                 <strong>Aviso:</strong> Asegúrese que los datos proporcionados son los mismos que están en su constancia de situación fiscal actualizada.
             </div>
         </xpath>
-
 
         <xpath expr="//div[hasclass('div_email')]" position="attributes">
             <attribute name="class" add="d-none" separator=" "/>

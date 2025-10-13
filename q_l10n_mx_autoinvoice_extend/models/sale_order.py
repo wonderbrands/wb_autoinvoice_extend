@@ -1,37 +1,34 @@
-import time
-
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
 from odoo.fields import Datetime
 
+
 class SaleOrder(models.Model):
     _inherit = 'sale.order'
 
-    # CON UNA NOTA DE CREDITO DESDE CERO
-    def _reprocess_from_global_invoice(self, global_invoice):
+    # Esta función SOLO se encarga de crear la NC en estado borrador.
+    # Es llamada al inicio del flujo para desbloquear la orden de venta.
+    def _create_draft_credit_note_for_autoinvoice(self, global_invoice):
+        """
+        Crea una Nota de Crédito en estado BORRADOR.
+        NO la publica, timbra ni reconcilia. Simplemente la crea y la devuelve.
+        """
         self.ensure_one()
-        #print(f"Iniciando reprocesamiento de orden {self.name}")
+        #print(f"Creando NC en BORRADOR para la orden {self.name}")
 
-        # Validar si ya existe NC
+        # Lógica de validación
         existing_refund = self.invoice_ids.filtered(
             lambda m: m.move_type == 'out_refund' and m.state in ('draft', 'posted')
         )
         if existing_refund:
             raise UserError(_("Ya existe una nota de crédito asociada a esta orden."))
+        if not global_invoice or not (
+                global_invoice.move_type == 'out_invoice' and global_invoice.state == 'posted' and global_invoice.partner_id.vat == 'XAXX010101000'):
+            raise UserError(_("No se proporcionó una factura global válida y publicada para crear la NC."))
 
-        # Validar que sea factura global
-        global_invoice = global_invoice.filtered(lambda m: (
-                m.move_type == 'out_invoice' and
-                m.state == 'posted' and
-                m.partner_id.vat == 'XAXX010101000'
-        ))
-        if not global_invoice:
-            raise UserError(_("No hay una factura global válida y publicada."))
+        #print(f"Generando borrador de NC desde la factura global {global_invoice.name}")
 
-        global_invoice = global_invoice[0] # La factura siempre es la primera
-        #print(f"Generando nueva nota de crédito (manual) basada en la orden: {self.name}")
-
-        # Crear encabezado de NC
+        # --- Lógica para preparar los valores de la NC ---
         refund_vals = {
             'move_type': 'out_refund',
             'invoice_origin': f"Nota de crédito por refacturación de {self.name}",
@@ -47,78 +44,58 @@ class SaleOrder(models.Model):
             'from_autoinvoice': True,
             'team_id': self.team_id.id,
         }
-
-        # Preparar líneas de productos
         invoice_lines = []
         for line in self.order_line:
+            # Lógica para crear líneas de factura
             income_account = (
                     line.product_id.property_account_income_id or
                     line.product_id.categ_id.property_account_income_categ_id
             )
             if not income_account:
-                raise UserError(_(
-                    "No se pudo encontrar cuenta contable para el producto '%s'."
-                ) % line.product_id.display_name)
-
+                raise UserError(
+                    _("No se pudo encontrar cuenta contable para el producto '%s'.") % line.product_id.display_name)
             line_vals = (0, 0, {
-                'product_id': line.product_id.id,
-                'name': line.name,
-                'quantity': line.product_uom_qty,
-                'price_unit': line.price_unit,
-                'account_id': income_account.id,
-                'tax_ids': [(6, 0, line.tax_id.ids)],
-                'product_uom_id': line.product_uom.id,
-                'sale_line_ids': [(6, 0, [line.id])],
+                'product_id': line.product_id.id, 'name': line.name, 'quantity': line.product_uom_qty,
+                'price_unit': line.price_unit, 'account_id': income_account.id, 'tax_ids': [(6, 0, line.tax_id.ids)],
+                'product_uom_id': line.product_uom.id, 'sale_line_ids': [(6, 0, [line.id])],
                 'analytic_account_id': line.order_id.analytic_account_id.id if line.order_id.analytic_account_id else False,
             })
             invoice_lines.append(line_vals)
 
-
-            #print(line_vals)
-
         refund_vals['invoice_line_ids'] = invoice_lines
-        #print(invoice_lines)
-        refund = self.env['account.move'].create(refund_vals)
 
-        # Recalcular
-        refund._recompute_dynamic_lines(recompute_all_taxes=True)
+        # --- Creación y devolución del borrador ---
+        refund_draft = self.env['account.move'].create(refund_vals)
+        refund_draft._recompute_dynamic_lines(recompute_all_taxes=True)
+        return refund_draft
 
-        # Confirmar
-        refund.action_post()
+    # Esta función toma un borrador de NC y lo procesa por completo.
+    # Se llama al FINAL del flujo, solo si la factura del cliente tuvo éxito.
+    def _commit_credit_note_for_autoinvoice(self, credit_note_draft, global_invoice):
+        """
+        Publica, timbra y reconcilia una Nota de Crédito en borrador.
+        """
+        #print(f"Haciendo 'commit' de la NC {credit_note_draft.name}: publicando, timbrando y reconciliando.")
 
-        # Timbrar
-        refund.button_process_edi_web_services()
+        credit_note_draft.action_post()
+        if credit_note_draft.l10n_mx_edi_cfdi_request == 'on_invoice':
+            credit_note_draft.button_process_edi_web_services()
 
-        # --------------------------------------------------------------------
-        # Cambio 11-sep-2025
-        # Linkear la NC con factura global (Agregar pago)
         try:
-            # Asegurarnos de trabajar con las líneas 'receivable' no reconciliadas
             inv_receivable_lines = global_invoice.line_ids.filtered(
-                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id
-            )
-            ref_receivable_lines = refund.line_ids.filtered(
-                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id
-            )
-
-            # Si hay líneas para conciliar, las juntamos y reconciliamos
+                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id)
+            ref_receivable_lines = credit_note_draft.line_ids.filtered(
+                lambda l: l.account_id.internal_type == 'receivable' and not l.full_reconcile_id)
             if inv_receivable_lines and ref_receivable_lines:
-                lines_to_reconcile = (inv_receivable_lines | ref_receivable_lines)
-                lines_to_reconcile.reconcile() # Metodo para pagar la NC a la factura global
-
-            else:
-                raise(f"No se encontraron líneas por conciliar entre NC {refund.name} y factura global {global_invoice.name}. Comuníquese con Servicio al Cliente")
+                (inv_receivable_lines | ref_receivable_lines).reconcile()
+                #print(f"NC {credit_note_draft.name} reconciliada con Factura Global {global_invoice.name}.")
         except Exception as e:
-            raise(f"Error al reconciliar NC {refund.name} con factura global {global_invoice.name}: {e}. Comuníquese con Servicio al Cliente")
-            # No paramos el flujo: dejamos que el usuario revise manualmente si algo falla.
-        # --------------------------------------------------------------------
+            pass
+            # print(f"Error al reconciliar NC {credit_note_draft.name}: {e}")
 
-        # Agregar mensaje
-        refund.message_post(
-            body=f"<p>Nota de crédito generada automáticamente por refacturación de la orden <b>{self.name}</b> a partir de la factura global <b>{global_invoice.name}</b>.</p>",
+        credit_note_draft.message_post(
+            body=f"<p>Nota de crédito generada y procesada automáticamente por refacturación de la orden <b>{self.name}</b>.</p>",
             message_type='notification',
             subtype_id=self.env.ref('mail.mt_note').id,
         )
-
-        return refund
-
+        return True

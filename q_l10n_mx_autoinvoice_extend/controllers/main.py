@@ -3,6 +3,7 @@ from odoo import http, _, fields
 from odoo.http import request
 from odoo.addons.q_l10n_mx_autoinvoice.controllers.main import Autoinvoice
 from datetime import date, timedelta
+from odoo.exceptions import UserError
 
 # ----------------------------------------------------------
 #Normalización de textos
@@ -109,46 +110,54 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
         else:
             rinv_incomplete = False
 
-        # -----------------------------------------------------------------------
-        # Crear la nota de crédito si existe la global
-        if global_invoice and not rinv_incomplete:
-            order._reprocess_from_global_invoice(global_invoice[0])
+            # -----------------------------------------------------------------------
+            # CAMBIO CLAVE: La creación de la NC EN BORRADOR se hace aquí, al inicio,
+            # para "desbloquear" la orden de venta y permitir la creación de la nueva factura.
+            # -----------------------------------------------------------------------
+            if global_invoice and not rinv_incomplete:
+                try:
+                    # Llamamos a la función que SÓLO crea el borrador
+                    credit_note_draft = order.sudo()._create_draft_credit_note_for_autoinvoice(global_invoice[0])
 
-        # -----------------------------------------------------------------------
-        # Mostrar formulario de dirección
-        template = request.env['ir.ui.view']._render_template('q_l10n_mx_autoinvoice.address', {
-            'country_id': request.env.ref('base.mx'),
-        })
+                    # Guardamos el ID de la NC en borrador en la sesión del usuario.
+                    # Esto nos permitirá recuperarla en el último paso para publicarla o eliminarla.
+                    request.session['autoinvoice_draft_nc_id'] = credit_note_draft.id
+                    #_logger.info(f"NC en borrador {credit_note_draft.name} (ID: {credit_note_draft.id}) creada y guardada en sesión.")
+                except Exception as e:
+                    # Si falla la creación del borrador de la NC, detenemos el proceso.
+                    #_logger.error("No se pudo crear la NC en borrador. Razón: %s", str(e))
+                    return {'error': str(e.args[0]) if isinstance(e, UserError) else str(e)}
 
+            # Imposibilita al cliente crear factura si aun no se ha entregado al menos una unidad de alun SKU
+            # Si solo tiene el envio hecho 'C-ENVIO', NO DEJA FACTURAR
+            SHIPPING_CODE = ['C-ENVIO']
+            non_shipping_lines = order.order_line.filtered(lambda l: not (
+                    (l.product_id.default_code and l.product_id.default_code.upper() in SHIPPING_CODE) or
+                    (l.product_id.name and l.product_id.name.upper() in SHIPPING_CODE)
+            ))
+            delivered_non_shipping = any([l.qty_delivered > 0 for l in non_shipping_lines])
+            if not delivered_non_shipping:
+                # Si fallamos aquí, debemos asegurarnos de limpiar la NC en borrador si se creó
+                draft_nc_id = request.session.pop('autoinvoice_draft_nc_id', None)
+                if draft_nc_id:
+                    request.env['account.move'].sudo().browse(draft_nc_id).unlink()
+                    #_logger.info(f"Rollback: NC en borrador {draft_nc_id} eliminada por fallo en validación de entrega.")
+                return {'error': _('No se puede facturar: Aun no hay artículos a facturar para esta orden')}
 
-        # ----------------------------------------------------------
-        # Cambio 11-sep-2025
-        # Imposibilita al cliente crear factura si aun no se ha entregado al menos una unidad de alun SKU
-        # Si solo tiene el envio hecho 'C-ENVIO', NO DEJA FACTURAR
+            # El flujo ahora puede continuar al formulario de dirección
+            template = request.env['ir.ui.view']._render_template('q_l10n_mx_autoinvoice.address', {
+                'country_id': request.env.ref('base.mx'),
+            })
+            return {
+                'order_id': order.id,
+                'template': template,
+            }
 
-        SHIPPING_CODE = ['C-ENVIO']
-
-        # Filtramos las líneas que no sean envío
-        non_shipping_lines = order.order_line.filtered(lambda l: not (
-                (l.product_id.default_code and l.product_id.default_code.upper() in SHIPPING_CODE) or
-                (l.product_id.name and l.product_id.name.upper() in SHIPPING_CODE)
-        ))
-
-        # Comprobamos si hay alguna linea no envío con qty entregada > 0
-        delivered_non_shipping = any([l.qty_delivered > 0 for l in non_shipping_lines])
-        if not delivered_non_shipping:
-            return {'error': _(
-                'No se puede facturar: Aun no hay artículos a facturar para esta orden')}
-
-        # ----------------------------------------------------------
-
-        return {
-            'order_id': order.id,
-            'template': template,
-        }
 
     @http.route('/q_l10n_mx_autoinvoice/select_address', type='json', auth='public', website=True, csrf=False)
     def autoinvoice_select_address(self, order_id, partner_id):
+        # La lógica de crear la factura en borrador funcionará
+        # porque la NC en borrador (creada en el paso anterior) ya "liberó" la orden de venta.
         user_root = request.env.ref('base.user_root')
         try:
             order = request.env['sale.order'].sudo().with_user(user_root).search([
@@ -186,57 +195,222 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
 
     # ----------------------------------------------------------
     #Normalización en ADD_ADDRESS
+    # CAMBIO: Se reescribe 'autoinvoice_add_address' para asegurar que el país (country_id)
+    # siempre se establezca al crear o buscar un partner, solucionando el error de validación de RFC.
     # ----------------------------------------------------------
     @http.route('/q_l10n_mx_autoinvoice/add_address', type='json', auth='public', website=True, csrf=False)
-    def autoinvoice_add_address(
-        self, name=False, vat=False, email=False, phone=False,
-        street_name=False, street_number=False,
-        l10n_mx_edi_colony=False, l10n_mx_edi_locality=False,
-        city=False, zipcode=False, country_id=False, state_id=False
-    ):
-        vals = normalize_values({
-            'name': name,
-            'vat': vat,
-            'email': email,
-            'phone': phone,
-            'street_name': street_name,
-            'street_number': street_number,
-            'l10n_mx_edi_colony': l10n_mx_edi_colony,
-            'l10n_mx_edi_locality': l10n_mx_edi_locality,
-            'city': city,
-            'zipcode': zipcode,
-        })
+    def autoinvoice_add_address(self, name=False, vat=False, zipcode=False, email=False, **kwargs):
+        # Usamos **kwargs para ignorar de forma segura los campos que ya no usamos (street_name, city, etc.)
+        user_root = request.env.ref('base.user_root')
 
-        return super().autoinvoice_add_address(
-            vals['name'], vals['vat'], vals['email'], vals['phone'],
-            vals['street_name'], vals['street_number'],
-            vals['l10n_mx_edi_colony'], vals['l10n_mx_edi_locality'],
-            vals['city'], vals['zipcode'],
-            country_id, state_id
-        )
+        try:
+            # Normalizamos los valores que sí recibimos.
+            vals = normalize_values({
+                'name': name,
+                'vat': vat,
+                'zipcode': zipcode,
+                'email': email,
+            })
+
+            # Buscamos si ya existe un partner con esa combinación de datos
+            domain = [('name', 'ilike', vals['name']), ('vat', '=', vals['vat'])]
+            if vals['vat'] != 'XAXX010101000':
+                domain.append(('zip', '=', vals['zipcode']))
+
+            partner = request.env['res.partner'].sudo().search(domain, limit=1)
+
+            # Si no existe el partner, lo creamos con los datos mínimos y el país correcto.
+            if not partner:
+                #_logger.info(f"No se encontró el partner. Creando uno nuevo con RFC: {vals['vat']}")
+                partner_values = {
+                    'type': 'invoice',
+                    'name': vals['name'],
+                    'vat': vals['vat'],
+                    'zip': vals['zipcode'],
+                    'email': vals['email'],
+                    # LÍNEA CLAVE: Se asigna México como país por defecto.
+                    'country_id': request.env.ref('base.mx').id,
+                }
+                partner = request.env['res.partner'].sudo().with_user(user_root).create(partner_values)
+
+            # Devolvemos el ID del partner encontrado o recién creado.
+            return {
+                'partner_id': partner.id,
+            }
+        except Exception as error:
+            #_logger.error("Error en autoinvoice_add_address: %s", str(error))
+            # Devolvemos un error claro al frontend
+            return {'error': str(error.args[0]) if isinstance(error,
+                                                              UserError) else 'Ocurrió un error al procesar sus datos.'}
 
     # ----------------------------------------------------------
     #Normalización en INFORMATION
+    # CAMBIO: Sobrescribimos 'autoinvoice_information' para tomar control total
+    # y evitar que el método original del módulo base publique la factura prematuramente.
     # ----------------------------------------------------------
     @http.route('/q_l10n_mx_autoinvoice/information', type='json', auth='public', website=True, csrf=False)
     def autoinvoice_information(self, invoice_id, fiscal_regime=False, use_of_cfdi=False, payment_method=False):
+        # Normalización de texto
         fiscal_regime = normalize_text(fiscal_regime)
         use_of_cfdi = normalize_text(use_of_cfdi)
         payment_method = normalize_text(payment_method)
 
-        return super().autoinvoice_information(
-            invoice_id, fiscal_regime, use_of_cfdi, payment_method
-        )
+        try:
+            invoice = request.env['account.move'].sudo().browse(int(invoice_id))
+
+            # Replicamos la lógica simple de solo GUARDAR los datos en la factura en borrador.
+            # Ya no llamamos a super(), evitando así el action_post() prematuro.
+            payment_method_id = request.env['l10n_mx_edi.payment.method'].sudo().search(
+                [('code', '=', payment_method)], limit=1).id
+
+            # Escribimos los valores en la factura y el partner asociados
+            invoice.write({
+                'l10n_mx_edi_usage': use_of_cfdi,
+                'l10n_mx_edi_payment_method_id': payment_method_id,
+                'l10n_mx_edi_payment_policy': 'PUE',  # Asumimos PUE para autofactura
+            })
+            invoice.partner_id.write({
+                'l10n_mx_edi_fiscal_regime': fiscal_regime,
+            })
+
+            #_logger.info(f"Información fiscal guardada en la factura borrador {invoice.name}. La factura NO ha sido publicada.")
+
+            # Devolvemos éxito para que el JavaScript del módulo base proceda
+            # a cambiar el botón de "Check" a "Timbrar".
+            return {'success': _('Information updated.')}
+
+        except Exception as e:
+            #_logger.error("Error en el paso intermedio 'autoinvoice_information': %s", str(e))
+            return {'error': 'Ocurrió un error al guardar la información fiscal.'}
 
     # ----------------------------------------------------------
     #Normalización en VALIDATE_INVOICE
     # ----------------------------------------------------------
+    # CAMBIO: Se sobrescribe 'validate_invoice' para implementar la transacción "Todo o Nada".
+    # CAMBIO FINAL: Lógica completa de "dos intentos" con "reinicio amigable" para cualquier tipo de error.
     @http.route('/q_l10n_mx_autoinvoice/validate_invoice', type='json', auth='public', website=True, csrf=False)
-    def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False, payment_method=False):
-        fiscal_regime = normalize_text(fiscal_regime)
-        use_of_cfdi = normalize_text(use_of_cfdi)
-        payment_method = normalize_text(payment_method)
+    def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False,
+                                     payment_method=False):
+        # --- PREPARACIÓN: Obtenemos todos los registros necesarios ---
+        user_root = request.env.ref('base.user_root')
+        customer_invoice_draft = request.env['account.move'].sudo().browse(int(invoice_id))
+        order = customer_invoice_draft.line_ids.sale_line_ids.order_id
 
-        return super().autoinvoice_validate_invoice(
-            invoice_id, fiscal_regime, use_of_cfdi, payment_method
-        )
+        # Recuperamos el ID de la NC en borrador y el contador de intentos desde la sesión del usuario.
+        draft_nc_id = request.session.get('autoinvoice_draft_nc_id')
+        credit_note_draft = request.env['account.move'].sudo().browse(draft_nc_id) if draft_nc_id else None
+        attempt_count = request.session.get('autoinvoice_attempt_count', 1)
+
+        #_logger.info(f"Procesando autofactura para la orden {order.name} - Intento #{attempt_count}")
+
+        try:
+            # -----------------------------------------------------------------
+            # FASE 1: PREPARAR Y PUBLICAR LA FACTURA DEL CLIENTE
+            # -----------------------------------------------------------------
+            #_logger.info(f"Fase Final: Intentando publicar y timbrar la factura del cliente {customer_invoice_draft.name}...")
+            payment_method_id = request.env['l10n_mx_edi.payment.method'].sudo().search(
+                [('code', '=', payment_method)],
+                limit=1).id
+            now = fields.Datetime.now()
+
+            # Escribimos los datos fiscales finales y forzamos la fecha actual para evitar errores del PAC.
+            customer_invoice_draft.write({
+                'invoice_date': now.date(),
+                'date': now.date(),
+                'l10n_mx_edi_usage': use_of_cfdi,
+                'l10n_mx_edi_payment_method_id': payment_method_id,
+                'l10n_mx_edi_payment_policy': 'PUE',
+            })
+            customer_invoice_draft.partner_id.write({'l10n_mx_edi_fiscal_regime': normalize_text(fiscal_regime)})
+
+            # Publicamos el asiento. Esto también dispara el intento de timbrado EDI.
+            customer_invoice_draft.action_post()
+
+            # -----------------------------------------------------------------
+            # FASE 2: VERIFICACIÓN EXPLÍCITA DEL RESULTADO DEL TIMBRADO
+            # -----------------------------------------------------------------
+            customer_invoice_draft.invalidate_cache(['l10n_mx_edi_cfdi_uuid'])
+
+            # La prueba definitiva: ¿La factura tiene un UUID del SAT?
+            if customer_invoice_draft.l10n_mx_edi_cfdi_uuid:
+                # -----------------------------------------------------------------
+                # FASE 3: ÉXITO - "COMMIT" FINAL DE LA NOTA DE CRÉDITO
+                # -----------------------------------------------------------------
+                #_logger.info(f"Éxito. La factura {customer_invoice_draft.name} tiene UUID. Procesando NC...")
+                if credit_note_draft and credit_note_draft.exists():
+                    global_invoice = order.invoice_ids.filtered(
+                        lambda
+                            i: i.move_type == 'out_invoice' and i.partner_id.vat == 'XAXX010101000' and i.state == 'posted'
+                    )
+                    order.sudo().with_user(user_root)._commit_credit_note_for_autoinvoice(credit_note_draft,
+                                                                                          global_invoice)
+
+                customer_invoice_draft.write({'from_autoinvoice': True})
+
+                # Limpiamos las variables de la sesión al terminar con éxito
+                if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
+                if 'autoinvoice_attempt_count' in request.session: del request.session['autoinvoice_attempt_count']
+
+                # Devolvemos la plantilla de descarga al frontend
+                template = request.env['ir.ui.view'].sudo()._render_template('q_l10n_mx_autoinvoice.download',
+                                                                             {
+                                                                                 'invoice_id': customer_invoice_draft.id})
+                return {'template': template}
+            else:
+                # --- FALLO DE TIMBRADO ---
+                #_logger.warning(f"Intento #{attempt_count} fallido: No se generó UUID para la factura {customer_invoice_draft.name}.")
+                edi_document = customer_invoice_draft.edi_document_ids.filtered(
+                    lambda d: d.state == 'to_send_failed')
+                error_from_pac = edi_document and edi_document[
+                    0].error or 'El PAC rechazó el documento. Verifique sus datos.'
+
+                # Devolvemos la factura a borrador.
+                if customer_invoice_draft.state == 'posted':
+                    customer_invoice_draft.button_draft()
+
+                if attempt_count < 2:
+                    # PRIMER FALLO: Rollback completo y reinicio amigable.
+                    #_logger.info("Primer intento fallido. Realizando rollback completo y pidiendo reinicio del flujo.")
+                    request.session['autoinvoice_attempt_count'] = attempt_count + 1
+
+                    if credit_note_draft and credit_note_draft.exists():
+                        credit_note_draft.sudo().unlink()
+                    if customer_invoice_draft and customer_invoice_draft.exists():
+                        customer_invoice_draft.sudo().unlink()
+
+                    if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
+
+                    return {'restart_flow': True, 'error': error_from_pac}
+                else:
+                    # SEGUNDO FALLO: Dejamos todo en borrador y forzamos el reinicio.
+                    #_logger.error("Segundo intento fallido. Forzando reinicio y mostrando mensaje final.")
+                    final_message = ("No fue posible validar sus datos fiscales después de dos intentos. "
+                                     "Por favor, contacte a Soporte al Cliente con su número de orden para recibir ayuda. "
+                                     f"Error del SAT: {error_from_pac}")
+
+                    # Limpiamos la sesión. Los documentos se quedan en borrador para revisión.
+                    if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
+                    if 'autoinvoice_attempt_count' in request.session: del request.session[
+                        'autoinvoice_attempt_count']
+
+                    return {'restart_flow': True, 'error': final_message}
+
+        except Exception as e:
+            # -----------------------------------------------------------------
+            # CAPTURA DE ERRORES CRÍTICOS (ROLLBACK TOTAL)
+            # -----------------------------------------------------------------
+            error_message = str(e.args[0]) if isinstance(e,
+                                                         UserError) else 'Ocurrió un error inesperado de sistema.'
+            #_logger.error(f"FALLO CRÍTICO en la transacción: {error_message}", exc_info=True)
+
+            if credit_note_draft and credit_note_draft.exists():
+                credit_note_draft.sudo().unlink()
+
+            if customer_invoice_draft and customer_invoice_draft.state == 'posted':
+                customer_invoice_draft.button_draft()
+
+            # Limpiamos todas nuestras variables de sesión.
+            if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
+            if 'autoinvoice_attempt_count' in request.session: del request.session['autoinvoice_attempt_count']
+
+            return {'restart_flow': True, 'error': error_message}
