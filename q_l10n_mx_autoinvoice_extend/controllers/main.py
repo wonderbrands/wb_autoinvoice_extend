@@ -5,6 +5,10 @@ from odoo.addons.q_l10n_mx_autoinvoice.controllers.main import Autoinvoice
 from datetime import date, timedelta
 from odoo.exceptions import UserError
 
+import logging
+_logger = logging.getLogger(__name__)
+
+
 # ----------------------------------------------------------
 #Normalización de textos
 # ----------------------------------------------------------
@@ -75,8 +79,7 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                         inv.state == 'posted'
         )
         if already_factured:
-            return {
-                'error': _(f"La orden ya fue facturada a cliente final. RFC: {already_factured[0].partner_id.vat}.")}
+            return {'error': _(f"La orden ya fue facturada a cliente final.")} # RFC: {already_factured[0].partner_id.vat}.")}
 
         # -----------------------------------------------------------------------
         # Factura global
@@ -125,7 +128,7 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                     #print(f"NC en borrador {credit_note_draft.name} (ID: {credit_note_draft.id}) creada y guardada en sesión.")
                 except Exception as e:
                     # Si falla la creación del borrador de la NC, detenemos el proceso.
-                    #_logger.error("No se pudo crear la NC en borrador. Razón: %s", str(e))
+                    ##print("No se pudo crear la NC en borrador. Razón: %s", str(e))
                     return {'error': str(e.args[0]) if isinstance(e, UserError) else str(e)}
 
             # Imposibilita al cliente crear factura si aun no se ha entregado al menos una unidad de alun SKU
@@ -202,45 +205,47 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
     def autoinvoice_add_address(self, name=False, vat=False, zipcode=False, **kwargs):
         user_root = request.env.ref('base.user_root')
         try:
-            # Limpiamos cualquier "backup" de una sesión anterior.
             if 'autoinvoice_partner_backup' in request.session:
                 del request.session['autoinvoice_partner_backup']
+            if not vat:
+                return {'error': 'El campo RFC es obligatorio.'}
 
-            vals = normalize_values({'name': name, 'vat': vat, 'zipcode': zipcode})
+            # Normalizamos y limpiamos el RFC para una búsqueda fiable.
+            search_vat = normalize_text(vat).strip()
 
-            domain = [('vat', '=', vals['vat'])]
-            partner = request.env['res.partner'].sudo().search(domain, limit=1)
+            # Buscamos un partner cuyo RFC sea IGUAL (case-insensitive) al proporcionado.
+            # Además, nos aseguramos de que no sea un contacto de una compañía (is_company=False o company_type='person')
+            # Esto evita conflictos si una compañía tiene el mismo RFC.
+            partner = request.env['res.partner'].sudo().search([
+                ('vat', '=ilike', search_vat),
+                '|', ('is_company', '=', False), ('company_type', '=', 'person')
+            ], limit=1)
 
+            vals_from_form = normalize_values({'name': name, 'zipcode': zipcode})
             values_to_write = {
-                'name': vals['name'],
-                'zip': vals['zipcode'],
+                'name': vals_from_form['name'],
+                'zip': vals_from_form['zipcode'],
+                'country_id': request.env.ref('base.mx').id,
             }
 
             if partner:
                 #print(f"Partner {partner.name} (ID: {partner.id}) encontrado. Guardando backup y actualizando.")
-                backup_data = {
-                    'partner_id': partner.id,
-                    'original_values': {
-                        'name': partner.name, 'zip': partner.zip,
-                    }
-                }
+                backup_data = {'partner_id': partner.id,
+                               'original_values': {'name': partner.name, 'zip': partner.zip,
+                                                   'l10n_mx_edi_fiscal_regime': partner.l10n_mx_edi_fiscal_regime}}
                 request.session['autoinvoice_partner_backup'] = backup_data
                 partner.sudo().with_user(user_root).write(values_to_write)
             else:
-                #print(f"No se encontró partner con RFC {vals['vat']}. Creando uno nuevo.")
+                #print(f"No se encontró partner. Creando uno nuevo con RFC: {search_vat}")
                 create_values = values_to_write.copy()
-                create_values.update({
-                    'vat': vals['vat'], 'country_id': request.env.ref('base.mx').id, 'type': 'invoice',
-                })
+                create_values.update({'vat': search_vat, 'type': 'invoice'})
                 partner = request.env['res.partner'].sudo().with_user(user_root).create(create_values)
                 request.session['autoinvoice_partner_backup'] = {'new_partner_id': partner.id}
 
             return {'partner_id': partner.id}
-
         except Exception as error:
-            #print("Error en autoinvoice_add_address: %s", str(error))
-            return {'error': str(error.args[0]) if isinstance(error,
-                                                              UserError) else 'Ocurrió un error al procesar sus datos.'}
+            _logger.error(f"Error en autoinvoice_add_address: {str(error)}")
+            return {'error': str(error.args[0]) if isinstance(error, UserError) else 'Ocurrió un error al procesar sus datos.'}
 
     # ----------------------------------------------------------
     #Normalización en INFORMATION
@@ -279,40 +284,38 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
             return {'success': _('Information updated.')}
 
         except Exception as e:
-            #_logger.error("Error en el paso intermedio 'autoinvoice_information': %s", str(e))
+            _logger.error(f"Error en el paso intermedio 'autoinvoice_information': {str(e)}")
             return {'error': 'Ocurrió un error al guardar la información fiscal.'}
 
     # ----------------------------------------------------------
     #Normalización en VALIDATE_INVOICE
     # ----------------------------------------------------------
     # CAMBIO: Se sobrescribe 'validate_invoice' para implementar la transacción "Todo o Nada".
-    # CAMBIO FINAL: Lógica de error simplificada. Siempre se hace rollback completo y se muestra
-    # un mensaje dinámico con el número de intento y el error específico del PAC.
+    # CAMBIO FINAL: Versión definitiva con rollback completo usando .sudo()
+    # y bloque 'finally' para garantizar la respuesta al navegador.
     @http.route('/q_l10n_mx_autoinvoice/validate_invoice', type='json', auth='public', website=True, csrf=False)
-    def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False, payment_method=False):
-        # --- Obtenemos todos los registros necesarios del entorno y la sesión ---
+    def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False,
+                                     payment_method=False):
+        # Registros necesarios del entorno y la sesión
         user_root = request.env.ref('base.user_root')
         customer_invoice_draft = request.env['account.move'].sudo().browse(int(invoice_id))
         order = customer_invoice_draft.line_ids.sale_line_ids.order_id
 
-        # Recuperamos los datos de la sesión para el rollback
+        # Datos de la sesión para el rollback
         draft_nc_id = request.session.get('autoinvoice_draft_nc_id')
         credit_note_draft = request.env['account.move'].sudo().browse(draft_nc_id) if draft_nc_id else None
         partner_backup = request.session.get('autoinvoice_partner_backup')
-
-        # Recuperamos o inicializamos el contador de intentos.
         attempt_count = request.session.get('autoinvoice_attempt_count', 1)
 
         #print(f"Procesando autofactura para la orden {order.name} - Intento #{attempt_count}")
 
-        # El bloque try...except ahora envuelve toda la operación para unificar el manejo de errores.
         try:
             # -----------------------------------------------------------------
             # FASE 1: PREPARAR Y PUBLICAR LA FACTURA DEL CLIENTE
             # -----------------------------------------------------------------
             #print(f"Intentando publicar y timbrar la factura {customer_invoice_draft.name}...")
-            payment_method_id = request.env['l10n_mx_edi.payment.method'].sudo().search([('code', '=', payment_method)],
-                                                                                        limit=1).id
+            payment_method_id = request.env['l10n_mx_edi.payment.method'].sudo().search(
+                [('code', '=', payment_method)], limit=1).id
             now = fields.Datetime.now()
 
             customer_invoice_draft.write({
@@ -348,28 +351,36 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                 # Limpiamos todas las variables de sesión al tener éxito.
                 if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
                 if 'autoinvoice_attempt_count' in request.session: del request.session['autoinvoice_attempt_count']
-                if 'autoinvoice_partner_backup' in request.session: del request.session['autoinvoice_partner_backup']
+                if 'autoinvoice_partner_backup' in request.session: del request.session[
+                    'autoinvoice_partner_backup']
 
-                template = request.env['ir.ui.view'].sudo()._render_template('q_l10n_mx_autoinvoice.download',
-                                                                             {'invoice_id': customer_invoice_draft.id})
+                template = request.env['ir.ui.view'].sudo()._render_template('q_l10n_mx_autoinvoice.download', {
+                    'invoice_id': customer_invoice_draft.id})
                 return {'template': template}
             else:
                 # --- FALLO DE TIMBRADO (SIN UUID) ---
                 # Incrementamos el contador para el siguiente intento.
                 request.session['autoinvoice_attempt_count'] = attempt_count + 1
 
-                #print(f"Intento #{attempt_count} fallido: No se generó UUID para la factura {customer_invoice_draft.name}.")
-                edi_document = customer_invoice_draft.edi_document_ids.filtered(lambda d: d.state == 'to_send_failed')
-                error_from_pac = edi_document and edi_document[
-                    0].error or 'El PAC rechazó el documento. Verifique sus datos.'
+                _logger.warning(
+                    f"Intento #{attempt_count} fallido: No se generó UUID para la factura {customer_invoice_draft.name}.")
 
-                # NUEVO: Construimos el mensaje de error dinámico.
-                error_message = (
-                    f"Intento #{attempt_count}: No fue posible validar sus datos fiscales. "
-                    f"Por favor, revise la información e intente de nuevo. "
-                    f"Error del SAT: {error_from_pac}"
-                )
-                # Si es el segundo intento o más, añadimos la sugerencia de contactar a soporte.
+                # Ordenamos los documentos EDI de la factura por ID descendente para obtener el más reciente.
+                latest_edi_doc = customer_invoice_draft.edi_document_ids.sorted('id', reverse=True)
+
+                # Asignamos un mensaje por defecto.
+                error_from_pac = 'El PAC rechazó el documento, pero no se encontró un mensaje de error detallado.'
+
+                # Si el documento más reciente existe y tiene un mensaje de error, lo usamos.
+                if latest_edi_doc and latest_edi_doc[0].error:
+                    # El campo 'error' contiene el mensaje exacto que devuelve el PAC.
+                    error_from_pac = latest_edi_doc[0].error
+                    _logger.info(f"Error EDI exacto encontrado: {error_from_pac}")
+                else:
+                    _logger.warning("No se encontró un mensaje de error explícito en el documento EDI más reciente.")
+
+                # Construimos el mensaje de error dinámico.
+                error_message = (f"Intento #{attempt_count}: {error_from_pac}")
                 if attempt_count >= 2:
                     error_message += " Si el problema persiste, por favor contacte a Soporte al Cliente."
 
@@ -378,37 +389,51 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
 
         except Exception as e:
             # -----------------------------------------------------------------
-            # FASE DE ERROR: ROLLBACK COMPLETO Y REINICIO DEL FLUJO
+            # FASE DE ERROR: ROLLBACK COMPLETO Y SEGURO USANDO .SUDO()
             # -----------------------------------------------------------------
-            # Obtenemos el mensaje de error, ya sea el que creamos nosotros o uno inesperado.
-            error_message = str(e.args[0]) if isinstance(e, UserError) else 'Ocurrió un error inesperado de sistema.'
-            #print(f"FALLO en la transacción de autofactura: {error_message}", exc_info=True)
+            error_message_to_show = str(e.args[0]) if isinstance(e, UserError) else 'Ocurrió un error inesperado de sistema.'
+            _logger.error(f"FALLO en la transacción de autofactura: {error_message_to_show}")
 
-            # 1. Rollback del Partner (cliente)
-            if partner_backup:
-                if 'original_values' in partner_backup:
-                    partner_to_restore = request.env['res.partner'].sudo().browse(partner_backup['partner_id'])
-                    if partner_to_restore.exists():
-                        partner_to_restore.write(partner_backup['original_values'])
-                        #print(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
-                elif 'new_partner_id' in partner_backup:
-                    request.env['res.partner'].sudo().browse(partner_backup['new_partner_id']).unlink()
-                    #print(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
+            try:
+                #print("Iniciando rollback completo (método sudo)...")
 
-            # 2. Rollback de la Nota de Crédito
-            if credit_note_draft and credit_note_draft.exists():
-                credit_note_draft.sudo().unlink()
-                #print(f"Rollback: La NC en borrador {credit_note_draft.name} ha sido eliminada.")
+                # 1. Rollback del Partner (cliente)
+                if partner_backup:
+                    if 'original_values' in partner_backup:
+                        partner_to_restore = request.env['res.partner'].sudo().browse(partner_backup['partner_id'])
+                        if partner_to_restore.exists():
+                            partner_to_restore.write(partner_backup['original_values'])
+                            #print(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
+                    elif 'new_partner_id' in partner_backup:
+                        request.env['res.partner'].sudo().browse(partner_backup['new_partner_id']).unlink()
+                        #print(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
 
-            # 3. Rollback de la Factura del Cliente (la eliminamos)
-            if customer_invoice_draft and customer_invoice_draft.exists():
-                # No es necesario regresarla a borrador, la eliminamos para un reinicio limpio.
-                customer_invoice_draft.sudo().unlink()
-                #print(f"Rollback: La factura de cliente en borrador {customer_invoice_draft.name} ha sido eliminada.")
+                # 2. Preparamos el "lote" de documentos a borrar
+                records_to_delete = request.env['account.move']
+                if credit_note_draft and credit_note_draft.exists():
+                    records_to_delete |= credit_note_draft
+                if customer_invoice_draft and customer_invoice_draft.exists():
+                    if customer_invoice_draft.state == 'posted':
+                        customer_invoice_draft.button_draft()
+                    records_to_delete |= customer_invoice_draft
 
-            # 4. Limpieza de sesión (excepto el contador de intentos que ya se actualizó)
-            if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
-            if 'autoinvoice_partner_backup' in request.session: del request.session['autoinvoice_partner_backup']
+                # 3. Borramos todos los documentos en UNA SOLA operación usando sudo().
+                if records_to_delete:
+                    records_to_delete.sudo().unlink()
+                    #print(f"Rollback: Documentos (IDs: {records_to_delete.ids}) eliminados en lote.")
 
-            # 5. Respuesta al frontend para que reinicie el flujo mostrando el error personalizado
-            return {'restart_flow': True, 'error': error_message}
+            except Exception as rollback_e:
+                _logger.critical(f"¡ERROR CRÍTICO DURANTE EL ROLLBACK!: {str(rollback_e)}")
+                pass
+
+            finally:
+                # ESTE BLOQUE 'finally' SIEMPRE SE EJECUTA
+                #print("Finalizando rollback y preparando respuesta al navegador.")
+
+                # Limpieza de sesión
+                if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
+                if 'autoinvoice_partner_backup' in request.session: del request.session[
+                    'autoinvoice_partner_backup']
+
+                # Respuesta garantizada al frontend
+                return {'restart_flow': True, 'error': error_message_to_show}
