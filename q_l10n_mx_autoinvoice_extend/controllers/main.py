@@ -4,6 +4,7 @@ from odoo.http import request
 from odoo.addons.q_l10n_mx_autoinvoice.controllers.main import Autoinvoice
 from datetime import date, timedelta
 from odoo.exceptions import UserError
+import re
 
 import logging
 _logger = logging.getLogger(__name__)
@@ -423,25 +424,24 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
     def _clean_pac_error_message(self, raw_error):
         """
         Filtra un mensaje de error del PAC para extraer solo el texto relevante,
-        eliminando HTML y otros textos no deseados.
+        eliminando CUALQUIER etiqueta HTML que encuentre.
         """
         if not isinstance(raw_error, str):
             return raw_error
 
-        try:
-            mensaje = raw_error
-            # Buscamos el inicio del mensaje principal
-            if '<li>Mensaje: ' in mensaje:
+        mensaje = raw_error
+        # Aislar el mensaje principal, si es posible.
+        if '<li>Mensaje: ' in mensaje:
+            try:
                 mensaje = mensaje.split('<li>Mensaje: ')[1]
+            except IndexError:
+                # Si el split falla por alguna razón, usamos el string original pero continuamos
+                pass
 
-            # Buscamos el final del mensaje principal (si existe)
-            if ' Folio:' in mensaje:
-                mensaje = mensaje.split(' Folio:')[0]
+        # Usamos una expresión regular para encontrar y eliminar todas las etiquetas HTML.
+        # La expresión r'<.*?>' busca cualquier cosa que empiece con '<' y termine con '>'.
+        patron_html = re.compile(r'<.*?>')
+        mensaje_sin_html = re.sub(patron_html, '', mensaje)
 
-            #Eliminamos las etiquetas HTML sobrantes y cualquier espacio en blanco extra al final.
-            mensaje_limpio = mensaje.replace('</li>', '').replace('</ul>', '').strip()
-
-            return mensaje_limpio
-        except IndexError:
-            # Si algo falla, devolvemos el error original para no perder información.
-            return raw_error
+        # Limpiamos espacios en blanco y devolvemos el texto puro.
+        return mensaje_sin_html.strip()
