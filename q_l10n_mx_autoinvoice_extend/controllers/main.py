@@ -364,7 +364,7 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                 # LLAMAMOS A NUESTRA FUNCIÓN DE LIMPIEZA
                 error_from_pac_clean = self._clean_pac_error_message(raw_error_from_pac)
 
-                error_message = f"Intento #{attempt_count}: {error_from_pac_clean}. Verifique sus datos."
+                error_message = f"Intento #{attempt_count}: {error_from_pac_clean}  ¡Verifique sus datos!"
                 if attempt_count >= 2:
                     error_message += " Si el problema persiste, contacte a Soporte al Cliente."
                 raise UserError(error_message)
