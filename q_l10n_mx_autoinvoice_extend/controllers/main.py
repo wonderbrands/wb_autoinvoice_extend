@@ -291,111 +291,93 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
     #Normalización en VALIDATE_INVOICE
     # ----------------------------------------------------------
     # CAMBIO: Se sobrescribe 'validate_invoice' para implementar la transacción "Todo o Nada".
-    # CAMBIO FINAL: Versión definitiva con rollback completo usando .sudo()
-    # y bloque 'finally' para garantizar la respuesta al navegador.
+    # CAMBIO FINAL: Se reestructura 'validate_invoice' para "envolver" la llamada a super()
+    # en lugar de reemplazarla. Esto asegura que la lógica de timbrado original se ejecute
+    # dentro de nuestro entorno transaccional seguro.
     @http.route('/q_l10n_mx_autoinvoice/validate_invoice', type='json', auth='public', website=True, csrf=False)
     def autoinvoice_validate_invoice(self, invoice_id, fiscal_regime=False, use_of_cfdi=False,
                                      payment_method=False):
-        # Registros necesarios del entorno y la sesión
+        # --- PREPARACIÓN: Obtenemos todos los registros necesarios del entorno y la sesión ---
         user_root = request.env.ref('base.user_root')
-        customer_invoice_draft = request.env['account.move'].sudo().browse(int(invoice_id))
+        env = request.env(user=user_root.id)  # Usamos un entorno de superusuario para consistencia
+
+        customer_invoice_draft = env['account.move'].browse(int(invoice_id))
         order = customer_invoice_draft.line_ids.sale_line_ids.order_id
 
-        # Datos de la sesión para el rollback
         draft_nc_id = request.session.get('autoinvoice_draft_nc_id')
-        credit_note_draft = request.env['account.move'].sudo().browse(draft_nc_id) if draft_nc_id else None
+        credit_note_draft = env['account.move'].browse(draft_nc_id) if draft_nc_id else None
         partner_backup = request.session.get('autoinvoice_partner_backup')
         attempt_count = request.session.get('autoinvoice_attempt_count', 1)
 
-        #print(f"Procesando autofactura para la orden {order.name} - Intento #{attempt_count}")
+        #_logger.info(f"Iniciando validación final para la orden {order.name} - Intento #{attempt_count}")
 
         try:
             # -----------------------------------------------------------------
-            # FASE 1: PREPARAR Y PUBLICAR LA FACTURA DEL CLIENTE
+            # Lógica de Preparación
+            # Se prepara la factura del cliente con los datos finales antes de llamar a super().
             # -----------------------------------------------------------------
-            #print(f"Intentando publicar y timbrar la factura {customer_invoice_draft.name}...")
-            payment_method_id = request.env['l10n_mx_edi.payment.method'].sudo().search(
-                [('code', '=', payment_method)], limit=1).id
-            now = fields.Datetime.now()
-
+            #_logger.info("Aplicando datos fiscales a la factura borrador...")
+            payment_method_id = env['l10n_mx_edi.payment.method'].search([('code', '=', payment_method)], limit=1).id
             customer_invoice_draft.write({
-                'invoice_date': now.date(), 'date': now.date(),
                 'l10n_mx_edi_usage': use_of_cfdi,
                 'l10n_mx_edi_payment_method_id': payment_method_id,
-                'l10n_mx_edi_payment_policy': 'PUE',
             })
             customer_invoice_draft.partner_id.write({'l10n_mx_edi_fiscal_regime': normalize_text(fiscal_regime)})
 
-            customer_invoice_draft.action_post()
+            # -----------------------------------------------------------------
+            # Llamamos al método original del módulo base
+            # -----------------------------------------------------------------
+            #_logger.info("Llamando a la lógica de timbrado original (super)...")
+            # El módulo base hace el trabajo pesado de publicar y timbrar
+            result_from_super = super(AutoinvoiceExtended, self).autoinvoice_validate_invoice(
+                invoice_id, fiscal_regime, use_of_cfdi, payment_method
+            )
+            #_logger.info("Lógica de timbrado original (super) completada.")
 
             # -----------------------------------------------------------------
-            # FASE 2: VERIFICACIÓN EXPLÍCITA DEL RESULTADO DEL TIMBRADO
+            # Revición del resultado y lógica de Finalización
             # -----------------------------------------------------------------
             customer_invoice_draft.invalidate_cache(['l10n_mx_edi_cfdi_uuid'])
-
             if customer_invoice_draft.l10n_mx_edi_cfdi_uuid:
-                # -----------------------------------------------------------------
-                # FASE 3: ÉXITO - "COMMIT" FINAL DE LA NOTA DE CRÉDITO
-                # -----------------------------------------------------------------
-                #print(f"Éxito. La factura {customer_invoice_draft.name} tiene UUID. Procesando NC...")
+                # ÉXITO: El 'super' funcionó y timbró la factura.
+                _logger.info(f"Éxito. La factura {customer_invoice_draft.name} tiene UUID. Procesando NC...")
                 if credit_note_draft and credit_note_draft.exists():
-                    global_invoice = order.invoice_ids.filtered(
-                        lambda
-                            i: i.move_type == 'out_invoice' and i.partner_id.vat == 'XAXX010101000' and i.state == 'posted'
-                    )
-                    order.sudo().with_user(user_root)._commit_credit_note_for_autoinvoice(credit_note_draft,
-                                                                                          global_invoice)
+                    global_invoice = order.invoice_ids.filtered(lambda
+                                                                    i: i.move_type == 'out_invoice' and i.partner_id.vat == 'XAXX010101000' and i.state == 'posted')
+                    order._commit_credit_note_for_autoinvoice(credit_note_draft, global_invoice)
 
-                customer_invoice_draft.write({'from_autoinvoice': True})
-
-                # Limpiamos todas las variables de sesión al tener éxito.
+                # Limpiamos sesión y devolvemos el resultado exitoso que nos dio super().
                 if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
                 if 'autoinvoice_attempt_count' in request.session: del request.session['autoinvoice_attempt_count']
                 if 'autoinvoice_partner_backup' in request.session: del request.session[
                     'autoinvoice_partner_backup']
-
-                template = request.env['ir.ui.view'].sudo()._render_template('q_l10n_mx_autoinvoice.download', {
-                    'invoice_id': customer_invoice_draft.id})
-                return {'template': template}
+                return result_from_super
             else:
-                # --- FALLO DE TIMBRADO (SIN UUID) ---
-                # Incrementamos el contador para el siguiente intento.
+                # FALLO: El 'super' falló silenciosamente o el PAC rechazó.
                 request.session['autoinvoice_attempt_count'] = attempt_count + 1
+                edi_doc = customer_invoice_draft.edi_document_ids.filtered(lambda d: d.state == 'to_send_failed')
+                # Extraemos el error del resultado de super() si existe, si no, del documento EDI.
+                raw_error_from_pac = (result_from_super.get('error') if isinstance(result_from_super, dict)
+                                      else edi_doc and edi_doc[0].error or 'El PAC rechazó el documento.')
 
-                _logger.warning(
-                    f"Intento #{attempt_count} fallido: No se generó UUID para la factura {customer_invoice_draft.name}.")
+                # LLAMAMOS A NUESTRA FUNCIÓN DE LIMPIEZA
+                error_from_pac_clean = self._clean_pac_error_message(raw_error_from_pac)
 
-                # Ordenamos los documentos EDI de la factura por ID descendente para obtener el más reciente.
-                latest_edi_doc = customer_invoice_draft.edi_document_ids.sorted('id', reverse=True)
-
-                # Asignamos un mensaje por defecto.
-                error_from_pac = 'El PAC rechazó el documento, pero no se encontró un mensaje de error detallado.'
-
-                # Si el documento más reciente existe y tiene un mensaje de error, lo usamos.
-                if latest_edi_doc and latest_edi_doc[0].error:
-                    # El campo 'error' contiene el mensaje exacto que devuelve el PAC.
-                    error_from_pac = latest_edi_doc[0].error
-                    _logger.info(f"Error EDI exacto encontrado: {error_from_pac}")
-                else:
-                    _logger.warning("No se encontró un mensaje de error explícito en el documento EDI más reciente.")
-
-                # Construimos el mensaje de error dinámico.
-                error_message = (f"Intento #{attempt_count}: {error_from_pac}")
+                error_message = f"Intento #{attempt_count}: {error_from_pac_clean}"
                 if attempt_count >= 2:
-                    error_message += " Si el problema persiste, por favor contacte a Soporte al Cliente."
-
-                # Forzamos la entrada al bloque 'except' para unificar y ejecutar el rollback completo.
+                    error_message += " Si el problema persiste, contacte a Soporte."
                 raise UserError(error_message)
 
         except Exception as e:
             # -----------------------------------------------------------------
             # FASE DE ERROR: ROLLBACK COMPLETO Y SEGURO USANDO .SUDO()
             # -----------------------------------------------------------------
-            error_message_to_show = str(e.args[0]) if isinstance(e, UserError) else 'Ocurrió un error inesperado de sistema.'
-            _logger.error(f"FALLO en la transacción de autofactura: {error_message_to_show}")
+            error_message_to_show = str(e.args[0]) if isinstance(e,
+                                                                 UserError) else 'Ocurrió un error inesperado de sistema.'
+            _logger.error(f"FALLO en la transacción de autofactura: {error_message_to_show}", exc_info=False)
 
             try:
-                #print("Iniciando rollback completo (método sudo)...")
+                _logger.info("Iniciando rollback completo...")
 
                 # 1. Rollback del Partner (cliente)
                 if partner_backup:
@@ -403,10 +385,10 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                         partner_to_restore = request.env['res.partner'].sudo().browse(partner_backup['partner_id'])
                         if partner_to_restore.exists():
                             partner_to_restore.write(partner_backup['original_values'])
-                            #print(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
+                            _logger.info(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
                     elif 'new_partner_id' in partner_backup:
                         request.env['res.partner'].sudo().browse(partner_backup['new_partner_id']).unlink()
-                        #print(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
+                        _logger.info(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
 
                 # 2. Preparamos el "lote" de documentos a borrar
                 records_to_delete = request.env['account.move']
@@ -417,18 +399,18 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                         customer_invoice_draft.button_draft()
                     records_to_delete |= customer_invoice_draft
 
-                # 3. Borramos todos los documentos en UNA SOLA operación usando sudo().
+                # 3. Borramos todos los documentos en una SOLA operación usando sudo().
                 if records_to_delete:
                     records_to_delete.sudo().unlink()
-                    #print(f"Rollback: Documentos (IDs: {records_to_delete.ids}) eliminados en lote.")
+                    _logger.info(f"Rollback: Documentos (IDs: {records_to_delete.ids}) eliminados en lote.")
 
             except Exception as rollback_e:
-                _logger.critical(f"¡ERROR CRÍTICO DURANTE EL ROLLBACK!: {str(rollback_e)}")
-                pass
+                # Si incluso este rollback simple falla, lo registramos pero continuamos.
+                _logger.critical("¡ERROR CRÍTICO DURANTE EL ROLLBACK!: %s", str(rollback_e))
 
             finally:
                 # ESTE BLOQUE 'finally' SIEMPRE SE EJECUTA
-                #print("Finalizando rollback y preparando respuesta al navegador.")
+                _logger.info("Finalizando rollback y preparando respuesta al navegador.")
 
                 # Limpieza de sesión
                 if 'autoinvoice_draft_nc_id' in request.session: del request.session['autoinvoice_draft_nc_id']
@@ -437,3 +419,24 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
 
                 # Respuesta garantizada al frontend
                 return {'restart_flow': True, 'error': error_message_to_show}
+
+    def _clean_pac_error_message(self, raw_error):
+        """
+        Filtra un mensaje de error del PAC envuelto en HTML para extraer solo el texto relevante.
+        """
+        # Si el error no es un string o no contiene "Mensaje:", devolvemos el error original.
+        if not isinstance(raw_error, str) or '<li>Mensaje: ' not in raw_error:
+            return raw_error
+
+        try:
+            # Extraer la segunda parte [1].
+            after_mensaje = raw_error.split('<li>Mensaje: ')[1]
+
+            # Extraer la primera parte [0].
+            mensaje_limpio = after_mensaje.split(' Folio:')[0]
+
+            # Devolvemos el mensaje limpio, quitando espacios extra.
+            return mensaje_limpio.strip()
+        except IndexError:
+            # Si algo falla en los splits, devolvemos el error original para no perder información.
+            return raw_error
