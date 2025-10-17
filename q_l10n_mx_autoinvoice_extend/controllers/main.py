@@ -363,9 +363,9 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
                 # LLAMAMOS A NUESTRA FUNCIÓN DE LIMPIEZA
                 error_from_pac_clean = self._clean_pac_error_message(raw_error_from_pac)
 
-                error_message = f"Intento #{attempt_count}: {error_from_pac_clean}"
+                error_message = f"Intento #{attempt_count}: {error_from_pac_clean}. Verifique sus datos."
                 if attempt_count >= 2:
-                    error_message += " Si el problema persiste, contacte a Soporte."
+                    error_message += " Si el problema persiste, contacte a Soporte al Cliente."
                 raise UserError(error_message)
 
         except Exception as e:
@@ -422,21 +422,26 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
 
     def _clean_pac_error_message(self, raw_error):
         """
-        Filtra un mensaje de error del PAC envuelto en HTML para extraer solo el texto relevante.
+        Filtra un mensaje de error del PAC para extraer solo el texto relevante,
+        eliminando HTML y otros textos no deseados.
         """
-        # Si el error no es un string o no contiene "Mensaje:", devolvemos el error original.
-        if not isinstance(raw_error, str) or '<li>Mensaje: ' not in raw_error:
+        if not isinstance(raw_error, str):
             return raw_error
 
         try:
-            # Extraer la segunda parte [1].
-            after_mensaje = raw_error.split('<li>Mensaje: ')[1]
+            mensaje = raw_error
+            # Buscamos el inicio del mensaje principal
+            if '<li>Mensaje: ' in mensaje:
+                mensaje = mensaje.split('<li>Mensaje: ')[1]
 
-            # Extraer la primera parte [0].
-            mensaje_limpio = after_mensaje.split(' Folio:')[0]
+            # Buscamos el final del mensaje principal (si existe)
+            if ' Folio:' in mensaje:
+                mensaje = mensaje.split(' Folio:')[0]
 
-            # Devolvemos el mensaje limpio, quitando espacios extra.
-            return mensaje_limpio.strip()
+            #Eliminamos las etiquetas HTML sobrantes y cualquier espacio en blanco extra al final.
+            mensaje_limpio = mensaje.replace('</li>', '').replace('</ul>', '').strip()
+
+            return mensaje_limpio
         except IndexError:
-            # Si algo falla en los splits, devolvemos el error original para no perder información.
+            # Si algo falla, devolvemos el error original para no perder información.
             return raw_error
