@@ -425,6 +425,7 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
         """
         Filtra un mensaje de error del PAC para extraer solo el texto relevante,
         eliminando CUALQUIER etiqueta HTML que encuentre.
+        
         """
         if not isinstance(raw_error, str):
             return raw_error
