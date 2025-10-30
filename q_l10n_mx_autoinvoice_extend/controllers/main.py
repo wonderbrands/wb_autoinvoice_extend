@@ -377,16 +377,25 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
             try:
                 # _logger.info("Iniciando rollback completo y sin estado...")
 
-                # 1. Rollback del Partner (cliente)
-                if partner_backup:
-                    if 'original_values' in partner_backup:
-                        partner_to_restore = env['res.partner'].browse(partner_backup['partner_id'])
-                        if partner_to_restore.exists():
-                            partner_to_restore.write(partner_backup['original_values'])
-                            _logger.info(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
-                    elif 'new_partner_id' in partner_backup:
-                        env['res.partner'].browse(partner_backup['new_partner_id']).unlink()
-                        _logger.info(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
+                #1. Rollback del Partner
+                # Se envuelve en su propio try/except para que no detenga el resto del rollback.
+                try:
+                    if partner_backup:
+                        if 'original_values' in partner_backup:
+                            partner_to_restore = env['res.partner'].browse(partner_backup['partner_id'])
+                            if partner_to_restore.exists():
+                                partner_to_restore.write(partner_backup['original_values'])
+                                _logger.info(f"Rollback: Datos del partner {partner_to_restore.name} restaurados.")
+                        elif 'new_partner_id' in partner_backup:
+                            partner_to_delete = env['res.partner'].browse(partner_backup['new_partner_id'])
+                            if partner_to_delete.exists():
+                                partner_to_delete.unlink()
+                                _logger.info(f"Rollback: Partner nuevo (ID: {partner_backup['new_partner_id']}) eliminado.")
+                except Exception as partner_rollback_e:
+                    # Si el rollback del partner falla,
+                    # lo registramos como una advertencia, pero NO detenemos el rollback de las facturas.
+                    _logger.warning(f"ADVERTENCIA: No se pudo completar el rollback del partner: {str(partner_rollback_e)}")
+                    # No hacemos 'raise', el flujo continúa.
 
                 # 2. Preparamos el "lote" de documentos a borrar (Búsqueda SIN ESTADO)
                 records_to_delete = env['account.move']
@@ -425,7 +434,7 @@ class AutoinvoiceExtended(Autoinvoice):  # Heredo de la clase Autoinvoice origin
         """
         Filtra un mensaje de error del PAC para extraer solo el texto relevante,
         eliminando CUALQUIER etiqueta HTML que encuentre.
-        
+
         """
         if not isinstance(raw_error, str):
             return raw_error
