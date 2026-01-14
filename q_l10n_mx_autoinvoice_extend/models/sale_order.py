@@ -78,8 +78,11 @@ class SaleOrder(models.Model):
         #print(f"Haciendo 'commit' de la NC {credit_note_draft.name}: publicando, timbrando y reconciliando.")
 
         credit_note_draft.action_post()
-        if credit_note_draft.l10n_mx_edi_cfdi_request == 'on_invoice':
+        try:
+            # button_process_edi_web_services busca documentos EDI pendientes y los envía al PAC
             credit_note_draft.button_process_edi_web_services()
+        except Exception as e:
+            pass
 
         try:
             inv_receivable_lines = global_invoice.line_ids.filtered(
